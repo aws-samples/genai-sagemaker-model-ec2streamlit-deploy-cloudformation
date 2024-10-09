@@ -1,0 +1,352 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Template to deploy Sagemaker inference endpoint and Streamlit App Stack in EC2
+
+Parameters:
+  ModelName:
+    Description: Model name
+    Type: String
+    Default: huggingface-llm-falcon-7b-instruct-bf16
+  InstanceType:
+      Description: Instance type
+      Type: String
+      Default: ml.g5.2xlarge
+  InstanceCount:
+    Description: Instance count
+    Type: String
+    Default: 1
+  MyIP:
+    Type: String
+    Description: Enter your public IP address as a CIDR notation from https://checkip.amazonaws.com/ site e.g. 10.0.0.10. Security group is setup with this /32 by default, but can be modified later.
+    AllowedPattern: (\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})
+    ConstraintDescription: Must be a valid IP address of the form x.x.x.x
+    Default: 10.0.0.10
+
+
+Mappings:
+  RegionMap:
+    us-west-2:
+      ModelDataUrl: s3://jumpstart-cache-prod-us-west-2/source-directory-tarballs/huggingface/inference/llm/v1.0.1/sourcedir.tar.gz              
+      TrainingImage: 763104351884.dkr.ecr.us-west-2.amazonaws.com/huggingface-pytorch-tgi-inference:2.1.1-tgi1.4.0-gpu-py310-cu121-ubuntu20.04
+    us-east-1:
+      ModelDataUrl: s3://jumpstart-cache-prod-us-east-1/source-directory-tarballs/huggingface/inference/llm/v1.0.1/sourcedir.tar.gz
+      TrainingImage: 763104351884.dkr.ecr.us-east-1.amazonaws.com/huggingface-pytorch-tgi-inference:2.1.1-tgi1.4.0-gpu-py310-cu121-ubuntu20.04
+  AmiMap:
+    us-west-2:
+      ImageId: ami-02d3770deb1c746ec
+    us-east-1:
+      ImageId: ami-066784287e358dad1
+
+Resources:
+  SageMakerExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - sagemaker.amazonaws.com
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: SageMakerExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sagemaker:CreateModel'
+                  - 'sagemaker:DeleteModel'
+                  - 'sagemaker:DescribeModel'
+                  - 'sagemaker:CreateEndpointConfig'
+                  - 'sagemaker:DeleteEndpointConfig'
+                  - 'sagemaker:DescribeEndpointConfig'
+                  - 'sagemaker:CreateEndpoint'
+                  - 'sagemaker:DeleteEndpoint'
+                  - 'sagemaker:DescribeEndpoint'
+                  - 'sagemaker:InvokeEndpoint'
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 's3:GetObject'
+                Resource: '*'
+
+  Model:
+    Type: "AWS::SageMaker::Model"
+    Properties: 
+      Containers: 
+        - 
+          Image: !FindInMap [RegionMap, !Ref AWS::Region, TrainingImage]
+          ModelDataUrl: !FindInMap [RegionMap, !Ref AWS::Region, ModelDataUrl]
+          Environment:
+            HF_MODEL_ID: "tiiuae/falcon-7b-instruct"  # Replace with your desired model ID
+            SM_NUM_GPUS: "1"  # Number of GPUs
+      ExecutionRoleArn: !GetAtt SageMakerExecutionRole.Arn
+
+  Endpoint:
+    Type: "AWS::SageMaker::Endpoint"
+    Properties: 
+      EndpointConfigName: !GetAtt EndpointConfig.EndpointConfigName
+
+  EndpointConfig:
+    Type: "AWS::SageMaker::EndpointConfig"
+    Properties:
+      ProductionVariants: 
+        -
+          ModelName: !GetAtt Model.ModelName
+          VariantName: variant-1
+          InitialInstanceCount: !Ref InstanceCount
+          InstanceType: !Ref InstanceType
+          InitialVariantWeight: 1.0
+      #Using a custom name will prevent updates with change sets
+
+  ChatEc2SSMIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: SageMakerEndpointAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sagemaker:InvokeEndpoint'
+                  - 'sagemaker:DescribeEndpoint'
+                Resource: '*'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref ChatEc2SSMIAMRole
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT30M
+    Properties:
+      InstanceType: t2.medium
+      ImageId: !FindInMap [AmiMap, !Ref AWS::Region, ImageId]
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !GetAtt EC2WebUISecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ChatAppEC2
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/bin/bash
+              set -e
+              yum update -y
+              echo "pg: updates complete in user-data"
+
+              cat << 'EOF' > /home/ec2-user/requirements.txt
+              boto3
+              streamlit
+              urllib3
+              constants
+              EOF
+
+              echo "pg: created requirements in user-data"
+              # Create a virtual environment
+              yum install -y python3
+              curl -O https://bootstrap.pypa.io/get-pip.py
+              python3 get-pip.py
+              cd /home/ec2-user
+              python3 -m venv myenv
+              source myenv/bin/activate
+              pip install -r /home/ec2-user/requirements.txt
+              echo "pg: installed requirements in user-data"
+              deactivate
+
+              cat << 'EOF' > /home/ec2-user/chatapp.py
+              import streamlit as st
+              import smjs as su
+              import difflib
+
+              st.markdown("<h1 style='font-size:1.5em;'>GenAI Chat Application </h1>", unsafe_allow_html=True)
+
+              # Get user input
+              user_prompt = st.chat_input("Your prompt")
+
+              # Create a sidebar for sliders
+              st.sidebar.title("Model Parameters")
+
+              # Add sliders for temperature, top_p, and top_k
+              temperature = st.sidebar.slider("Temperature", min_value=0.0, max_value=1.0, value=0.2, step=0.1)
+              top_p = st.sidebar.slider("Top-p", min_value=0.1, max_value=1.0, value=0.7, step=0.1)
+              max_new_tokens = st.sidebar.slider("Max New Tokens", min_value=50, max_value=1000, value=500, step=50)
+              #top_k = st.slider("Top-k", min_value=1, max_value=100, value=50, step=1)
+
+              if user_prompt:
+                  st.markdown("User Input:")
+                  st.write(user_prompt)  # Display user input
+
+                  # Generate model response
+                  response = su.generate_response(user_prompt, temperature, top_p, max_new_tokens)
+                  
+                  if response:
+                      # Get generated text 
+                      generated_text = response[0]['generated_text']  
+                      
+                      # Compare and remove user prompt
+                      match = difflib.SequenceMatcher(None, user_prompt, generated_text).find_longest_match(0, len(user_prompt), 0, len(generated_text))
+                      model_response = generated_text[match.size:] 
+                      
+                      st.markdown("Model Response:")
+                      st.write(model_response) 
+                      
+                  else:
+                      st.warning("No response")
+              EOF
+
+              cat << 'EOF' > /home/ec2-user/smjs.py
+              import boto3, json
+              #import constants as const
+              region_name = "<aws-region>"
+              endpoint_name = "<Endpoint-name>"
+
+              #MAX_LENGTH = 2048
+              MAX_LENGTH = 4096
+              NUM_RETURN_SEQUENCES = 1
+              TOP_K = 0
+              TOP_P = 0.7
+              DO_SAMPLE = True
+              CONTENT_TYPE = 'application/json'
+
+              def generate_response(prompt, temperature, top_p, max_new_tokens):
+                  session = boto3.Session(region_name=region_name)
+                  smclient = session.client('sagemaker-runtime')
+
+                  content_type = 'application/json'
+                  input_data = {
+                      "inputs": prompt,
+                      "parameters": {
+                          "do_sample": True,
+                          "top_p": top_p, 
+                          "temperature": temperature,
+                          "max_new_tokens": max_new_tokens,
+                          "stop": ["<|endoftext|>", "</s>"]
+                      }
+                  }
+                  payload = json.dumps(input_data)                                            # Payload for inference.
+                  print(f"calling SagemMaker endpoint with: {input_data}")
+
+                  response = smclient.invoke_endpoint(
+                      EndpointName=endpoint_name, 
+                      ContentType=content_type,
+                      Body=payload
+                  )
+
+                  result = json.loads(response['Body'].read().decode())
+                  return result
+              EOF
+
+
+              # Use the output of the custom resource which will contain the endpoint name - not working
+              sed -i "s#<Endpoint-name>#${EndpointName}#" smjs.py
+              sed -i "s#<aws-region>#${AWS::Region}#" smjs.py  # Update region in smjs.py
+              echo "pg: downloaded app files in user-data"
+              # Enable SSM (Systems Manager) for EC2
+              yum install -y amazon-ssm-agent
+              systemctl enable amazon-ssm-agent
+              systemctl start amazon-ssm-agent
+
+              # Create a systemd service unit file for Streamlit
+              cat << EOF > /etc/systemd/system/streamlit.service
+              [Unit]
+              Description=Streamlit Service
+              After=network.target
+
+              [Service]
+              ExecStart=/home/ec2-user/myenv/bin/streamlit run /home/ec2-user/chatapp.py
+              WorkingDirectory=/home/ec2-user
+              User=ec2-user
+              Group=ec2-user
+
+              [Install]
+              WantedBy=multi-user.target
+              EOF
+
+              # Enable and start the Streamlit service
+              systemctl daemon-reload
+              systemctl enable streamlit
+              systemctl start streamlit
+
+              cd /root && wget -qO- https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz | tar zxf -
+              cd /root/aws-cfn-bootstrap-2.0 && python3 setup.py install
+              /usr/local/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource EC2Instance --region ${AWS::Region}
+            - EndpointName: !GetAtt Endpoint.EndpointName
+            
+  StreamlitEIP:
+    Type: AWS::EC2::EIP
+  StreamlitEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt StreamlitEIP.AllocationId
+      InstanceId: !Ref EC2Instance
+
+
+  EC2WebUISecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allowed source IP and ports for WebUI in EC2 instance
+
+  StreamlitSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt EC2WebUISecurityGroup.GroupId
+      Description: Streamlit (IPv4)
+      IpProtocol: tcp
+      FromPort: 8501
+      ToPort: 8501
+      CidrIp: !Join [ "", [ !Ref MyIP, "/32" ] ]
+
+  IPv4SecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt EC2WebUISecurityGroup.GroupId
+      Description: Allow all outbound traffic (IPv4)
+      IpProtocol: "-1"
+      CidrIp: 0.0.0.0/0
+
+  IPv6SecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt EC2WebUISecurityGroup.GroupId
+      Description: Allow all outbound traffic (IPv6)
+      IpProtocol: "-1"
+      CidrIpv6: ::/0
+
+
+Outputs:
+
+  EndpointName:
+    Value: !GetAtt Endpoint.EndpointName
+
+  EC2PublicIP:
+    Description: Public IP of the EC2 Instance
+    Value: !GetAtt EC2Instance.PublicIp
+
+  WebUIURL:
+    Description: URL for Falcon Chat UI
+    Value: !Sub http://${StreamlitEIP.PublicIp}:8501
